@@ -11,29 +11,41 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.asset_name }})
+    name: Build (${{ matrix.target_label }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            asset_name: nodekilla-linux-x86_64
+            platform: linux
+            arch: x86_64
+            target_label: linux-x86_64
             ext: ""
           - os: ubuntu-24.04-arm
-            asset_name: nodekilla-linux-arm64
+            platform: linux
+            arch: arm64
+            target_label: linux-arm64
             ext: ""
           - os: macos-15-intel
-            asset_name: nodekilla-macos-x86_64
+            platform: macos
+            arch: x86_64
+            target_label: macos-x86_64
             ext: ""
           - os: macos-15
-            asset_name: nodekilla-macos-arm64
+            platform: macos
+            arch: arm64
+            target_label: macos-arm64
             ext: ""
           - os: windows-latest
-            asset_name: nodekilla-windows-x86_64
+            platform: windows
+            arch: x86_64
+            target_label: windows-x86_64
             ext: ".exe"
           - os: windows-11-arm
-            asset_name: nodekilla-windows-arm64
+            platform: windows
+            arch: arm64
+            target_label: windows-arm64
             ext: ".exe"
 
     steps:
@@ -55,13 +67,80 @@ jobs:
         run: |
           cargo build --release
           mkdir -p dist
-          cp "target/release/nodekilla${{ matrix.ext }}" "dist/${{ matrix.asset_name }}${{ matrix.ext }}"
+          cp "target/release/nodekilla${{ matrix.ext }}" "dist/nodekilla-${{ matrix.target_label }}${{ matrix.ext }}"
 
-      - name: Upload build artifact
+      # ---------------- LINUX: .deb, .rpm, .AppImage ----------------
+      - name: Package Linux (.deb, .rpm, .AppImage)
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          # 1. .deb
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+          cp target/debian/*.deb "dist/nodekilla-${{ matrix.target_label }}.deb"
+
+          # 2. .rpm
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm
+          cp target/generate-rpm/*.rpm "dist/nodekilla-${{ matrix.target_label }}.rpm"
+
+          # 3. .AppImage
+          mkdir -p AppDir/usr/bin
+          cp target/release/nodekilla AppDir/usr/bin/nodekilla
+          cat << 'EOF' > AppDir/AppRun
+          #!/bin/sh
+          exec "$(dirname "$0")/usr/bin/nodekilla" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+
+          cat << 'EOF' > AppDir/nodekilla.desktop
+          [Desktop Entry]
+          Type=Application
+          Name=Nodekilla
+          Exec=nodekilla
+          Icon=nodekilla
+          Terminal=true
+          Categories=Utility;Development;
+          EOF
+
+          # Minimal 1x1 PNG icon required by appimagetool
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > AppDir/nodekilla.png
+
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            APPIMAGE_ARCH="aarch64"
+          else
+            APPIMAGE_ARCH="x86_64"
+          fi
+          curl -fSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage"
+          chmod +x appimagetool
+          ARCH="${APPIMAGE_ARCH}" ./appimagetool --appimage-extract-and-run AppDir "dist/nodekilla-${{ matrix.target_label }}.AppImage"
+
+      # ---------------- MACOS: .dmg ----------------
+      - name: Package macOS (.dmg)
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          mkdir -p dmg_root
+          cp target/release/nodekilla dmg_root/nodekilla
+          hdiutil create -volname "Nodekilla" -srcfolder dmg_root -ov -format UDZO \
+            "dist/nodekilla-${{ matrix.target_label }}.dmg"
+
+      # ---------------- WINDOWS: .msi ----------------
+      - name: Package Windows (.msi)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          cargo install cargo-wix --locked
+          cargo wix init --force
+          cargo wix --no-build --nocapture
+          $msi = Get-ChildItem -Path target/wix -Filter "*.msi" | Select-Object -First 1
+          Copy-Item $msi.FullName "dist/nodekilla-${{ matrix.target_label }}.msi"
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}${{ matrix.ext }}
+          name: ${{ matrix.target_label }}
+          path: dist/*
 
   release:
     name: Publish GitHub Release

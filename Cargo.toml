@@ -1,7 +1,11 @@
 [package]
 name = "nodekilla"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
+description = "The simplest node_modules grim reaper written in 🦀Rust."
+license = "MIT"
+authors = ["Changda (Steven) Han <hi@nidexingg.com>"]
+repository = "https://github.com/nidexingg/nodekilla"
 
 [dependencies]
 
