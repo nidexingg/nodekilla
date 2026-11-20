@@ -38,23 +38,24 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
       - name: Ensure Rust toolchain is installed
         shell: bash
         run: |
-          if ! command -v rustc >/dev/null 2>&1; then
+          if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
           rustc --version
+          cargo --version
 
-      - name: Compile optimized binary
+      - name: Build release binary
         shell: bash
         run: |
+          cargo build --release
           mkdir -p dist
-          rustc -C opt-level=3 -C lto=fat -C codegen-units=1 -C strip=symbols \
-            nodekilla.rs -o "dist/${{ matrix.asset_name }}${{ matrix.ext }}"
+          cp "target/release/nodekilla${{ matrix.ext }}" "dist/${{ matrix.asset_name }}${{ matrix.ext }}"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
@@ -69,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
