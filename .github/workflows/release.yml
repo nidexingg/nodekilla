@@ -125,17 +125,6 @@ jobs:
           hdiutil create -volname "Nodekilla" -srcfolder dmg_root -ov -format UDZO \
             "dist/nodekilla-${{ matrix.target_label }}.dmg"
 
-      # ---------------- WINDOWS: .msi ----------------
-      - name: Package Windows (.msi)
-        if: matrix.platform == 'windows'
-        shell: pwsh
-        run: |
-          cargo install cargo-wix --locked
-          cargo wix init --force
-          cargo wix --no-build --nocapture
-          $msi = Get-ChildItem -Path target/wix -Filter "*.msi" | Select-Object -First 1
-          Copy-Item $msi.FullName "dist/nodekilla-${{ matrix.target_label }}.msi"
-
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
