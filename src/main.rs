@@ -3,21 +3,23 @@ use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::thread;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 struct Config {
     base_dir: PathBuf,
     sort_by_size: bool,
     dry_run: bool,
+    no_size: bool,
+    workers: usize,
 }
 
 struct Item {
     project: String,
     path: PathBuf,
-    size: u64,
+    size: Option<u64>,
     age_days: Option<u64>,
 }
 
@@ -28,26 +30,51 @@ fn default_base_dir() -> PathBuf {
         .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
+fn default_workers() -> usize {
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 fn parse_args() -> Result<Config, i32> {
     let mut base_dir = None;
     let mut sort_by_size = false;
     let mut dry_run = false;
+    let mut no_size = false;
+    let mut workers = default_workers();
 
-    for arg in env::args().skip(1) {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: nodekilla [TARGET_DIR] [--sort-size] [--dry-run]\n\n\
+                    "Usage: nodekilla [TARGET_DIR] [OPTIONS]\n\n\
                      Options:\n  \
-                       TARGET_DIR   Directory to scan (default: directory of executable)\n  \
-                       --sort-size  Sort results by size descending\n  \
-                       --dry-run    Simulate deletion without removing files\n  \
-                       -h, --help   Show this help message"
+                       TARGET_DIR       Directory to scan (default: directory of executable)\n  \
+                       -s, --sort-size  Sort results by size descending\n  \
+                       -n, --dry-run    Simulate deletion without removing files\n  \
+                       --no-size        Skip folder size calculation for fast previews\n  \
+                       -j, --workers N  Number of worker threads (default: logical CPUs)\n  \
+                       -h, --help       Show this help message"
                 );
                 return Err(0);
             }
             "--sort-size" | "-s" => sort_by_size = true,
             "--dry-run" | "-n" => dry_run = true,
+            "--no-size" => no_size = true,
+            "--workers" | "-j" => {
+                let Some(val) = args.next() else {
+                    eprintln!("Missing value for {arg}");
+                    return Err(1);
+                };
+                match val.parse::<usize>() {
+                    Ok(n) if n >= 1 => workers = n,
+                    _ => {
+                        eprintln!("Invalid worker count: {val} (must be >= 1)");
+                        return Err(1);
+                    }
+                }
+            }
             _ if arg.starts_with('-') => {
                 eprintln!("Unknown option: {arg} (use --help for usage)");
                 return Err(1);
@@ -63,6 +90,11 @@ fn parse_args() -> Result<Config, i32> {
         }
     }
 
+    if sort_by_size && no_size {
+        eprintln!("Cannot combine --sort-size with --no-size");
+        return Err(1);
+    }
+
     let base_dir = base_dir.unwrap_or_else(default_base_dir);
     let base_dir = fs::canonicalize(&base_dir).unwrap_or(base_dir);
 
@@ -70,78 +102,67 @@ fn parse_args() -> Result<Config, i32> {
         base_dir,
         sort_by_size,
         dry_run,
+        no_size,
+        workers,
     })
 }
 
-fn worker_count(task_count: usize) -> usize {
-    let cores = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    cores.min(task_count.max(1))
-}
-
-/// Iterative walk to find all `node_modules` under `root` without following symlinks.
-fn walk_for_node_modules(root: PathBuf) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![root];
-
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_symlink() || !ft.is_dir() {
-                continue;
-            }
-
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str == "node_modules" {
-                found.push(entry.path());
-                continue;
-            }
-            if name_str.starts_with('.') {
-                continue;
-            }
-            stack.push(entry.path());
-        }
+/// Pure-std bounded work-sharing queue using a single Mutex + Condvar thread pool.
+fn parallel_work_queue<T, F>(initial: Vec<T>, workers: usize, visit: F)
+where
+    T: Send,
+    F: Fn(T) -> Vec<T> + Sync,
+{
+    if initial.is_empty() {
+        return;
     }
-    found
-}
 
-/// Iterative directory size calculation using `entry.metadata()` (no symlink following).
-fn dir_size(root: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let mut stack = vec![root.to_path_buf()];
-
-    while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            if ft.is_dir() {
-                stack.push(entry.path());
-            } else if let Ok(meta) = entry.metadata() {
-                total += meta.len();
-            }
-        }
+    struct QueueState<T> {
+        tasks: Vec<T>,
+        active: usize,
     }
-    total
+
+    let queue = Mutex::new(QueueState {
+        tasks: initial,
+        active: 0,
+    });
+    let cvar = Condvar::new();
+    let num_workers = workers.max(1);
+
+    thread::scope(|s| {
+        for _ in 0..num_workers {
+            s.spawn(|| {
+                loop {
+                    let task = {
+                        let mut state = queue.lock().unwrap();
+                        loop {
+                            if let Some(t) = state.tasks.pop() {
+                                state.active += 1;
+                                break Some(t);
+                            }
+                            if state.active == 0 {
+                                cvar.notify_all();
+                                break None;
+                            }
+                            state = cvar.wait(state).unwrap();
+                        }
+                    };
+
+                    let Some(task) = task else { break };
+                    let next_tasks = visit(task);
+
+                    let mut state = queue.lock().unwrap();
+                    let added = !next_tasks.is_empty();
+                    state.tasks.extend(next_tasks);
+                    state.active -= 1;
+
+                    if added || (state.tasks.is_empty() && state.active == 0) {
+                        cvar.notify_all();
+                    }
+                }
+            });
+        }
+    });
 }
 
 fn age_in_days(path: &Path) -> Option<u64> {
@@ -150,71 +171,131 @@ fn age_in_days(path: &Path) -> Option<u64> {
     Some(elapsed.as_secs() / 86_400)
 }
 
-fn scan_projects_parallel(base: &Path) -> Vec<Item> {
-    let entries = match fs::read_dir(base) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
+/// Phase 1: Discover all `node_modules` folders using one shared worker pool.
+fn discover_node_modules(base: &Path, workers: usize) -> Vec<PathBuf> {
+    let found = Mutex::new(Vec::<PathBuf>::new());
+
+    parallel_work_queue(vec![base.to_path_buf()], workers, |dir| {
+        let mut subdirs = Vec::new();
+        let mut local_found = Vec::new();
+
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() || !ft.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+
+                if name_str == "node_modules" {
+                    local_found.push(entry.path());
+                    continue; // Never descend into node_modules
+                }
+                if name_str.starts_with('.') {
+                    continue; // Never descend into hidden directories
+                }
+                subdirs.push(entry.path());
+            }
+        }
+
+        if !local_found.is_empty() {
+            found.lock().unwrap().extend(local_found);
+        }
+        subdirs
+    });
+
+    found.into_inner().unwrap()
+}
+
+/// Phase 2: Size ALL discovered `node_modules` folders using ONE reused worker pool.
+fn size_all_parallel(paths: &[PathBuf], workers: usize) -> Vec<u64> {
+    let totals: Vec<AtomicU64> = (0..paths.len()).map(|_| AtomicU64::new(0)).collect();
+    let initial: Vec<(usize, PathBuf)> = paths
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, p.clone()))
+        .collect();
+
+    parallel_work_queue(initial, workers, |(idx, dir)| {
+        let mut subdirs = Vec::new();
+        let mut local_bytes: u64 = 0;
+
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    subdirs.push((idx, entry.path()));
+                } else if let Ok(meta) = entry.metadata() {
+                    local_bytes += meta.len();
+                }
+            }
+        }
+
+        if local_bytes > 0 {
+            totals[idx].fetch_add(local_bytes, Ordering::Relaxed);
+        }
+        subdirs
+    });
+
+    totals.into_iter().map(AtomicU64::into_inner).collect()
+}
+
+fn scan_projects(cfg: &Config) -> (Vec<Item>, Duration, Option<Duration>) {
+    let discover_start = Instant::now();
+    let nm_paths = discover_node_modules(&cfg.base_dir, cfg.workers);
+    let discover_elapsed = discover_start.elapsed();
+
+    if nm_paths.is_empty() {
+        return (Vec::new(), discover_elapsed, None);
+    }
+
+    let (sizes, size_elapsed) = if cfg.no_size {
+        (vec![None; nm_paths.len()], None)
+    } else {
+        let size_start = Instant::now();
+        let raw_sizes = size_all_parallel(&nm_paths, cfg.workers);
+        let elapsed = size_start.elapsed();
+        (raw_sizes.into_iter().map(Some).collect(), Some(elapsed))
     };
 
-    let mut subdirs: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .filter_map(|entry| {
-            let ft = entry.file_type().ok()?;
-            if ft.is_symlink() || !ft.is_dir() {
-                return None;
+    let mut items: Vec<Item> = nm_paths
+        .into_iter()
+        .zip(sizes)
+        .map(|(path, size)| {
+            let project = path
+                .strip_prefix(&cfg.base_dir)
+                .ok()
+                .and_then(|rel| rel.components().next())
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_else(|| ".".to_string());
+
+            let age_days = age_in_days(&path);
+
+            Item {
+                project,
+                path,
+                size,
+                age_days,
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                return None;
-            }
-            Some((name, entry.path()))
         })
         .collect();
 
-    subdirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-    if subdirs.is_empty() {
-        return Vec::new();
-    }
-
-    let next_idx = AtomicUsize::new(0);
-    let results = Mutex::new(Vec::<(usize, Item)>::new());
-    let num_workers = worker_count(subdirs.len());
-
-    thread::scope(|s| {
-        for _ in 0..num_workers {
-            s.spawn(|| {
-                loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= subdirs.len() {
-                        break;
-                    }
-                    let (proj, path) = &subdirs[idx];
-                    let paths = walk_for_node_modules(path.clone());
-                    let mut local = Vec::with_capacity(paths.len());
-                    for nm_path in paths {
-                        let size = dir_size(&nm_path);
-                        let age_days = age_in_days(&nm_path);
-                        local.push((
-                            idx,
-                            Item {
-                                project: proj.clone(),
-                                path: nm_path,
-                                size,
-                                age_days,
-                            },
-                        ));
-                    }
-                    if !local.is_empty() {
-                        results.lock().unwrap().extend(local);
-                    }
-                }
-            });
-        }
+    items.sort_by(|a, b| {
+        a.project
+            .to_lowercase()
+            .cmp(&b.project.to_lowercase())
+            .then_with(|| a.path.cmp(&b.path))
     });
 
-    let mut collected = results.into_inner().unwrap();
-    collected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.path.cmp(&b.1.path)));
-    collected.into_iter().map(|(_, item)| item).collect()
+    (items, discover_elapsed, size_elapsed)
 }
 
 fn human_size(num: u64) -> String {
@@ -233,6 +314,13 @@ fn human_size(num: u64) -> String {
     format!("{val:.1} TB")
 }
 
+fn format_size(size: Option<u64>) -> String {
+    match size {
+        Some(bytes) => human_size(bytes),
+        None => "-".to_string(),
+    }
+}
+
 fn format_age(days: Option<u64>) -> String {
     match days {
         Some(0) => "today".to_string(),
@@ -241,7 +329,12 @@ fn format_age(days: Option<u64>) -> String {
     }
 }
 
+/// Parse '1 3 5-7' style input with range clamping to prevent huge-range hangs.
 fn parse_selection(text: &str, max_num: usize) -> Vec<usize> {
+    if max_num == 0 {
+        return Vec::new();
+    }
+
     let mut picked = BTreeSet::new();
     for token in text.replace(',', " ").split_whitespace() {
         if let Some((a, b)) = token.split_once('-') {
@@ -256,10 +349,13 @@ fn parse_selection(text: &str, max_num: usize) -> Vec<usize> {
                     } else {
                         (end, start)
                     };
-                    for n in lo..=hi {
-                        if n >= 1 && n <= max_num {
-                            picked.insert(n);
-                        }
+                    if hi < 1 || lo > max_num {
+                        continue;
+                    }
+                    let clamped_lo = lo.max(1);
+                    let clamped_hi = hi.min(max_num);
+                    for n in clamped_lo..=clamped_hi {
+                        picked.insert(n);
                     }
                 }
             }
@@ -311,42 +407,58 @@ fn main() {
         Err(code) => std::process::exit(code),
     };
 
-    println!("\nScanning projects in: {}", cfg.base_dir.display());
+    println!(
+        "\nScanning projects in: {} (workers: {})",
+        cfg.base_dir.display(),
+        cfg.workers
+    );
     if cfg.dry_run {
         println!("(DRY RUN mode: no files will be deleted)");
     }
 
-    let scan_start = Instant::now();
-    let mut items = scan_projects_parallel(&cfg.base_dir);
-    let scan_elapsed = scan_start.elapsed();
+    let (mut items, discover_elapsed, size_elapsed) = scan_projects(&cfg);
 
     if items.is_empty() {
-        println!("\nNo node_modules folders found. Nothing to do. 🎉");
+        println!(
+            "\nNo node_modules folders found (discovery: {:.2}s). Nothing to do. 🎉",
+            discover_elapsed.as_secs_f64()
+        );
         return;
     }
 
     if cfg.sort_by_size {
-        items.sort_by(|a, b| b.size.cmp(&a.size));
+        items.sort_by(|a, b| b.size.unwrap_or(0).cmp(&a.size.unwrap_or(0)));
     }
 
-    println!(
-        "\nFound {} node_modules in {:.2}s:\n",
-        items.len(),
-        scan_elapsed.as_secs_f64()
-    );
+    match size_elapsed {
+        Some(se) => println!(
+            "\nFound {} node_modules (discovery: {:.2}s, sizing: {:.2}s):\n",
+            items.len(),
+            discover_elapsed.as_secs_f64(),
+            se.as_secs_f64()
+        ),
+        None => println!(
+            "\nFound {} node_modules (discovery: {:.2}s, sizing: skipped):\n",
+            items.len(),
+            discover_elapsed.as_secs_f64()
+        ),
+    }
+
     for (idx, item) in items.iter().enumerate() {
         let i = idx + 1;
         let rel = rel_display(&item.path, &cfg.base_dir);
         println!(
             "  [{i:>2}] {:<20} {:>10}  {:>7}  ({rel})",
             item.project,
-            human_size(item.size),
+            format_size(item.size),
             format_age(item.age_days)
         );
     }
 
-    let total: u64 = items.iter().map(|i| i.size).sum();
-    println!("\n  Total reclaimable: {}", human_size(total));
+    if !cfg.no_size {
+        let total: u64 = items.iter().filter_map(|i| i.size).sum();
+        println!("\n  Total reclaimable: {}", human_size(total));
+    }
 
     println!("\nSelect which to delete:");
     println!("  - numbers separated by space/comma, ranges ok: 1 3 5-7");
@@ -381,18 +493,23 @@ fn main() {
     };
 
     let to_delete: Vec<&Item> = selected.iter().map(|&i| &items[i - 1]).collect();
-    let sel_size: u64 = to_delete.iter().map(|i| i.size).sum();
 
-    println!(
-        "\nYou selected {} folder(s), ~{} will be freed:",
-        to_delete.len(),
-        human_size(sel_size)
-    );
+    if cfg.no_size {
+        println!("\nYou selected {} folder(s):", to_delete.len());
+    } else {
+        let sel_size: u64 = to_delete.iter().filter_map(|i| i.size).sum();
+        println!(
+            "\nYou selected {} folder(s), ~{} will be freed:",
+            to_delete.len(),
+            human_size(sel_size)
+        );
+    }
+
     for item in &to_delete {
         println!(
             "  - {} ({})",
             rel_display(&item.path, &cfg.base_dir),
-            human_size(item.size)
+            format_size(item.size)
         );
     }
 
@@ -419,7 +536,7 @@ fn main() {
     let freed = Mutex::new(0u64);
     let failed = Mutex::new(0usize);
     let output_lock = Mutex::new(());
-    let num_workers = worker_count(to_delete.len());
+    let num_workers = cfg.workers.min(to_delete.len().max(1));
 
     thread::scope(|s| {
         for _ in 0..num_workers {
@@ -441,7 +558,9 @@ fn main() {
 
                     match fs::remove_dir_all(&item.path) {
                         Ok(()) => {
-                            *freed.lock().unwrap() += item.size;
+                            if let Some(sz) = item.size {
+                                *freed.lock().unwrap() += sz;
+                            }
                             let _g = output_lock.lock().unwrap();
                             println!("  ✔ deleted {rel}");
                         }
@@ -458,11 +577,15 @@ fn main() {
 
     let freed_total = freed.into_inner().unwrap();
     let failed_count = failed.into_inner().unwrap();
-    println!(
-        "\nDone in {:.2}s. Freed ~{}.",
-        del_start.elapsed().as_secs_f64(),
-        human_size(freed_total)
-    );
+    if cfg.no_size {
+        println!("\nDone in {:.2}s.", del_start.elapsed().as_secs_f64());
+    } else {
+        println!(
+            "\nDone in {:.2}s. Freed ~{}.",
+            del_start.elapsed().as_secs_f64(),
+            human_size(freed_total)
+        );
+    }
     if failed_count > 0 {
         println!(
             "{failed_count} folder(s) could not be deleted (file in use? close editors/terminals/servers and retry)."
